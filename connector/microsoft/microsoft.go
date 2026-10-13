@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 
 	"github.com/dexidp/dex/connector"
 	groups_pkg "github.com/dexidp/dex/pkg/groups"
@@ -42,6 +43,15 @@ const (
 	// Microsoft requires this scope to return a refresh token
 	// see https://docs.microsoft.com/en-us/azure/active-directory/develop/v2-permissions-and-consent#offline_access
 	scopeOfflineAccess = "offline_access"
+)
+
+const (
+	// The only subject token type accepted for token exchange: an access token
+	// issued to this connector's application.
+	tokenTypeAccess = "urn:ietf:params:oauth:token-type:access_token"
+	// Grant type of the On-Behalf-Of flow
+	// see https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow
+	grantTypeJWTBearer = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 )
 
 // Config holds configuration options for Microsoft logins.
@@ -138,8 +148,9 @@ type connectorData struct {
 }
 
 var (
-	_ connector.CallbackConnector = (*microsoftConnector)(nil)
-	_ connector.RefreshConnector  = (*microsoftConnector)(nil)
+	_ connector.CallbackConnector      = (*microsoftConnector)(nil)
+	_ connector.RefreshConnector       = (*microsoftConnector)(nil)
+	_ connector.TokenIdentityConnector = (*microsoftConnector)(nil)
 )
 
 type microsoftConnector struct {
@@ -441,6 +452,52 @@ func (c *microsoftConnector) Refresh(ctx context.Context, s connector.Scopes, id
 	}
 
 	return identity, nil
+}
+
+// TokenIdentity exchanges an access token issued to this connector's
+// application for a Graph token through the On-Behalf-Of flow, then builds the
+// user's identity as a login would. Entra only completes the exchange when the
+// subject token's audience is this application, so the subject token is never
+// validated locally.
+func (c *microsoftConnector) TokenIdentity(ctx context.Context, subjectTokenType, subjectToken string) (identity connector.Identity, err error) {
+	if subjectTokenType != tokenTypeAccess {
+		return identity, fmt.Errorf("microsoft: unsupported subject token type for token exchange: %s", subjectTokenType)
+	}
+	// On-Behalf-Of and group lookups both need a tenant to act in.
+	if !c.isOrgTenant() {
+		return identity, fmt.Errorf("microsoft: token exchange requires a specific tenant, not %q", c.tenant)
+	}
+
+	// Scopes are not provided in token exchange, so always resolve groups,
+	// which requires Directory.Read.All consent.
+	s := connector.Scopes{Groups: true}
+	oauth2Config := c.oauth2Config(s)
+
+	ctx, err = c.tokenEndpointContext(ctx, oauth2Config.Endpoint.TokenURL)
+	if err != nil {
+		return identity, err
+	}
+
+	// clientcredentials only provides the token request here: it allows
+	// EndpointParams to override grant_type with the On-Behalf-Of grant.
+	oboConfig := &clientcredentials.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		TokenURL:     oauth2Config.Endpoint.TokenURL,
+		Scopes:       oauth2Config.Scopes,
+		EndpointParams: url.Values{
+			"grant_type":          {grantTypeJWTBearer},
+			"assertion":           {subjectToken},
+			"requested_token_use": {"on_behalf_of"},
+		},
+		AuthStyle: oauth2Config.Endpoint.AuthStyle,
+	}
+	token, err := oboConfig.Token(ctx)
+	if err != nil {
+		return identity, fmt.Errorf("microsoft: on-behalf-of exchange: %w", err)
+	}
+
+	return c.userIdentity(ctx, oauth2.NewClient(ctx, oauth2.StaticTokenSource(token)), s)
 }
 
 func (c *microsoftConnector) setPreferredUsername(identity *connector.Identity, u user) {

@@ -11,8 +11,11 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
+
+	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
 )
@@ -360,5 +363,191 @@ func expectNil(t *testing.T, a interface{}) {
 func expectEquals(t *testing.T, a interface{}, b interface{}) {
 	if !reflect.DeepEqual(a, b) {
 		t.Errorf("Expected %+v to equal %+v", a, b)
+	}
+}
+
+// oboTestServer simulates the Entra token endpoint answering On-Behalf-Of
+// requests with tokenStatus and tokenBody, and the Graph endpoints in graph.
+// It records the token request and the Authorization header Graph saw.
+type oboTestServer struct {
+	*httptest.Server
+	mu       sync.Mutex // guards recorded
+	recorded oboRequests
+}
+
+type oboRequests struct {
+	tokenForm          url.Values
+	tokenAuthorization string
+	graphAuthorization string
+	calls              int
+}
+
+// requests returns what the server has recorded so far.
+func (s *oboTestServer) requests() oboRequests {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recorded
+}
+
+func newOBOTestServer(t *testing.T, tokenStatus int, tokenBody interface{}, graph map[string]testResponse) *oboTestServer {
+	s := &oboTestServer{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.recorded.calls++
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "POST" && r.URL.Path == "/"+tenant+"/oauth2/v2.0/token" {
+			if err := r.ParseForm(); err != nil {
+				t.Errorf("failed to parse token request: %v", err)
+			}
+			s.recorded.tokenForm = r.PostForm
+			s.recorded.tokenAuthorization = r.Header.Get("Authorization")
+			w.WriteHeader(tokenStatus)
+			json.NewEncoder(w).Encode(tokenBody)
+			return
+		}
+		response, found := graph[r.RequestURI]
+		if !found {
+			t.Errorf("unexpected request %s %s", r.Method, r.RequestURI)
+			http.NotFound(w, r)
+			return
+		}
+		s.recorded.graphAuthorization = r.Header.Get("Authorization")
+		json.NewEncoder(w).Encode(response.data)
+	}))
+	return s
+}
+
+var oboGraphResponses = map[string]testResponse{
+	"/v1.0/me?$select=id,displayName,userPrincipalName,mailNickname,onPremisesSamAccountName": {
+		data: user{ID: "user-id-123", Name: "Jane Doe", Email: "Jane.Doe@example.com", MailNickname: "janedoe"},
+	},
+	"/v1.0/me/getMemberGroups": {data: map[string]interface{}{
+		"value": []string{"a", "b"},
+	}},
+}
+
+var oboToken = map[string]interface{}{
+	"access_token": "graph-token",
+	"token_type":   "Bearer",
+	"expires_in":   3600,
+}
+
+func TestTokenIdentityOnBehalfOf(t *testing.T) {
+	s := newOBOTestServer(t, http.StatusOK, oboToken, oboGraphResponses)
+	defer s.Close()
+
+	c := microsoftConnector{
+		apiURL:                 s.URL,
+		graphURL:               s.URL,
+		tenant:                 tenant,
+		clientID:               clientID,
+		clientSecret:           "secret",
+		emailToLowercase:       true,
+		preferredUsernameField: "mailNickname",
+	}
+	identity, err := c.TokenIdentity(t.Context(), tokenTypeAccess, "subject-token")
+	expectNil(t, err)
+
+	got := s.requests()
+	expectEquals(t, got.tokenForm.Get("grant_type"), grantTypeJWTBearer)
+	expectEquals(t, got.tokenForm.Get("assertion"), "subject-token")
+	expectEquals(t, got.tokenForm.Get("requested_token_use"), "on_behalf_of")
+	expectEquals(t, got.tokenForm.Get("scope"), scopeUser+" "+scopeGroups)
+	tokenReq := http.Request{Header: http.Header{"Authorization": {got.tokenAuthorization}}}
+	username, password, ok := tokenReq.BasicAuth()
+	if !ok || username != clientID || password != "secret" {
+		t.Errorf("expected client credentials in Basic auth on the token request, got %q", got.tokenAuthorization)
+	}
+	expectEquals(t, got.graphAuthorization, "Bearer graph-token")
+
+	expectEquals(t, identity.UserID, "user-id-123")
+	expectEquals(t, identity.Username, "Jane Doe")
+	expectEquals(t, identity.Email, "jane.doe@example.com")
+	expectEquals(t, identity.EmailVerified, true)
+	expectEquals(t, identity.PreferredUsername, "janedoe")
+	expectEquals(t, identity.Groups, []string{"a", "b"})
+	expectEquals(t, len(identity.ConnectorData), 0)
+}
+
+func TestTokenIdentityClientAssertion(t *testing.T) {
+	assertion := "dummy-jwt-assertion"
+	file, err := os.CreateTemp("", "assertion.jwt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(file.Name())
+	file.WriteString(assertion + "\n")
+	file.Close()
+
+	s := newOBOTestServer(t, http.StatusOK, oboToken, oboGraphResponses)
+	defer s.Close()
+
+	c := microsoftConnector{
+		apiURL:          s.URL,
+		graphURL:        s.URL,
+		tenant:          tenant,
+		clientID:        clientID,
+		clientSecret:    "should-not-be-used",
+		clientAssertion: file.Name(),
+	}
+	_, err = c.TokenIdentity(t.Context(), tokenTypeAccess, "subject-token")
+	expectNil(t, err)
+
+	got := s.requests()
+	expectEquals(t, got.tokenForm.Get("assertion"), "subject-token")
+	expectEquals(t, got.tokenForm.Get("client_assertion"), assertion)
+	expectEquals(t, got.tokenForm.Get("client_assertion_type"), "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+	expectEquals(t, got.tokenForm.Get("client_id"), clientID)
+	expectEquals(t, got.tokenForm.Get("client_secret"), "")
+	expectEquals(t, got.tokenAuthorization, "")
+}
+
+func TestTokenIdentityOnBehalfOfRejected(t *testing.T) {
+	s := newOBOTestServer(t, http.StatusBadRequest, map[string]interface{}{
+		"error":             "invalid_grant",
+		"error_description": "AADSTS50013: Assertion failed signature validation.",
+	}, nil)
+	defer s.Close()
+
+	c := microsoftConnector{apiURL: s.URL, graphURL: s.URL, tenant: tenant, clientID: clientID, clientSecret: "secret"}
+	_, err := c.TokenIdentity(t.Context(), tokenTypeAccess, "subject-token")
+	if err == nil {
+		t.Fatal("expected error when the On-Behalf-Of exchange is rejected, got nil")
+	}
+	var retrieveErr *oauth2.RetrieveError
+	if !errors.As(err, &retrieveErr) || retrieveErr.ErrorCode != "invalid_grant" {
+		t.Errorf("expected invalid_grant *oauth2.RetrieveError, got %T: %v", err, err)
+	}
+	if s.requests().graphAuthorization != "" {
+		t.Errorf("expected Graph not to be called after a rejected exchange")
+	}
+}
+
+func TestTokenIdentityRejectsUnsupportedRequests(t *testing.T) {
+	tests := []struct {
+		name             string
+		tenant           string
+		subjectTokenType string
+	}{
+		{"id token", tenant, "urn:ietf:params:oauth:token-type:id_token"},
+		{"empty token type", tenant, ""},
+		{"common tenant", "common", tokenTypeAccess},
+		{"organizations tenant", "organizations", tokenTypeAccess},
+		{"consumers tenant", "consumers", tokenTypeAccess},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newOBOTestServer(t, http.StatusOK, oboToken, oboGraphResponses)
+			defer s.Close()
+
+			c := microsoftConnector{apiURL: s.URL, graphURL: s.URL, tenant: tt.tenant, clientID: clientID, clientSecret: "secret"}
+			_, err := c.TokenIdentity(t.Context(), tt.subjectTokenType, "subject-token")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			expectEquals(t, s.requests().calls, 0)
+		})
 	}
 }

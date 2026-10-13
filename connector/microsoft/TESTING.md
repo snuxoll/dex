@@ -9,6 +9,7 @@ This guide covers how to test the Microsoft connector with both client secret an
 - Dex built locally (`make build examples`)
 - `jq` (for JSON parsing)
 - `kubectl` - for testing using Federated Credential
+- `curl` and `uuidgen` - for testing token exchange
 
 ## Setup Azure AD Application
 
@@ -397,6 +398,103 @@ echo "Connector ID: microsoft-k8s"
 rm "${CONFIG_FILE}"
 rm "${K8S_TOKEN_FILE}"
 ```
+
+## Method 4: Testing Token Exchange
+
+Token exchange lets a client trade a Microsoft access token it already holds,
+here one from the Azure CLI, for a Dex token without a browser login. Dex
+exchanges the token with Microsoft through the On-Behalf-Of flow, which only
+succeeds when the token was issued for this application.
+
+This builds on the application from [Setup](#setup-azure-ad-application) and
+either the client secret from Method 1 or the client assertion from Method 2.
+The account you are logged in to `az` with must belong to `${TENANT_ID}`.
+When using the client assertion, regenerate the JWT as in Method 2 if it is
+more than an hour old.
+
+### Expose an API and Pre-Authorize the Azure CLI
+
+```bash
+AZURE_CLI_APP_ID=04b07795-8ddb-461a-bbee-02f9e1bf7b46
+OBJECT_ID=$(az ad app show --id "${APP_ID}" --query id -o tsv)
+SCOPE_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+az ad app update --id "${APP_ID}" --identifier-uris "api://${APP_ID}"
+
+SCOPES=$(jq -n --arg id "${SCOPE_ID}" '[{
+  id: $id, value: "user_impersonation", type: "User", isEnabled: true,
+  adminConsentDisplayName: "Exchange tokens with Dex",
+  adminConsentDescription: "Exchange tokens with Dex",
+  userConsentDisplayName: "Exchange tokens with Dex",
+  userConsentDescription: "Exchange tokens with Dex"
+}]')
+
+# A scope must exist before it can be pre-authorized, so this takes two updates.
+az rest --method PATCH \
+  --uri "https://graph.microsoft.com/v1.0/applications/${OBJECT_ID}" \
+  --headers Content-Type=application/json \
+  --body "$(jq -n --argjson scopes "${SCOPES}" '{api: {oauth2PermissionScopes: $scopes}}')"
+
+az rest --method PATCH \
+  --uri "https://graph.microsoft.com/v1.0/applications/${OBJECT_ID}" \
+  --headers Content-Type=application/json \
+  --body "$(jq -n --argjson scopes "${SCOPES}" --arg cli "${AZURE_CLI_APP_ID}" --arg id "${SCOPE_ID}" \
+    '{api: {oauth2PermissionScopes: $scopes, preAuthorizedApplications: [{appId: $cli, delegatedPermissionIds: [$id]}]}}')"
+```
+
+Token exchange always resolves groups, so the admin consent for
+`Directory.Read.All` from [Setup](#setup-azure-ad-application) is required.
+
+### Create Dex Configuration for Token Exchange
+
+Use the configuration from Method 1 or Method 2 (skip its final `rm`) and add a
+client for the exchange to the `staticClients` list:
+
+```yaml
+  - id: token-exchange-client
+    name: 'Token Exchange Client'
+    secret: token-exchange-secret
+```
+
+Token exchange is in the default `oauth2.grantTypes`, so no other changes are
+needed.
+
+### Run the Test
+
+```bash
+# Terminal 1: Start Dex
+./bin/dex serve "${CONFIG_FILE}"
+
+# Terminal 2: Exchange an Azure CLI token for a Dex token
+exchange() {
+  curl -s http://127.0.0.1:5556/dex/token \
+    --user token-exchange-client:token-exchange-secret \
+    --data-urlencode connector_id=microsoft \
+    --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+    --data-urlencode scope="openid email profile groups" \
+    --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:access_token \
+    --data-urlencode subject_token="$1"
+}
+
+claims() {
+  local payload
+  payload=$(jq -r .access_token | cut -d. -f2 | tr '_-' '/+')
+  while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+  echo "${payload}" | base64 -d
+}
+
+# Expected: a Dex token with your email and groups
+exchange "$(az account get-access-token --scope "api://${APP_ID}/.default" --query accessToken -o tsv)" | claims | jq
+
+# Expected: {"error":"access_denied"}, with an AADSTS500131 audience mismatch in the Dex log
+exchange "$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)"
+```
+
+Use the `connector_id` of the connector in your configuration, e.g.
+`microsoft-assertion` for Method 2. Dex logs the reason for a rejected exchange
+as `failed to verify subject token`, including Microsoft's `AADSTS` error code.
+`AADSTS65001` naming `Microsoft Azure CLI` means the Azure CLI was not
+pre-authorized for the exposed scope.
 
 ## Cleanup
 

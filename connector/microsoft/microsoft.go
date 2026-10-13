@@ -262,6 +262,29 @@ func (t *assertionTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return t.base.RoundTrip(req)
 }
 
+// tokenEndpointContext returns ctx carrying an HTTP client that injects the
+// configured client assertion into requests to tokenURL. Without a client
+// assertion, ctx is returned unchanged.
+func (c *microsoftConnector) tokenEndpointContext(ctx context.Context, tokenURL string) (context.Context, error) {
+	if c.clientAssertion == "" {
+		return ctx, nil
+	}
+
+	assertionBytes, err := os.ReadFile(c.clientAssertion)
+	if err != nil {
+		return ctx, fmt.Errorf("microsoft: failed to read client assertion: %v", err)
+	}
+
+	httpClient := &http.Client{
+		Transport: &assertionTransport{
+			assertion: strings.TrimSpace(string(assertionBytes)),
+			tokenURL:  tokenURL,
+			base:      http.DefaultTransport,
+		},
+	}
+	return context.WithValue(ctx, oauth2.HTTPClient, httpClient), nil
+}
+
 func (c *microsoftConnector) HandleCallback(s connector.Scopes, connData []byte, r *http.Request) (identity connector.Identity, err error) {
 	q := r.URL.Query()
 	if errType := q.Get("error"); errType != "" {
@@ -270,24 +293,9 @@ func (c *microsoftConnector) HandleCallback(s connector.Scopes, connData []byte,
 
 	oauth2Config := c.oauth2Config(s)
 
-	ctx := r.Context()
-
-	// If using client assertion, wrap the HTTP client with a custom transport
-	if c.clientAssertion != "" {
-		assertionBytes, err := os.ReadFile(c.clientAssertion)
-		if err != nil {
-			return identity, fmt.Errorf("microsoft: failed to read client assertion: %v", err)
-		}
-
-		// Create HTTP client with custom transport that injects client_assertion
-		httpClient := &http.Client{
-			Transport: &assertionTransport{
-				assertion: strings.TrimSpace(string(assertionBytes)),
-				tokenURL:  oauth2Config.Endpoint.TokenURL,
-				base:      http.DefaultTransport,
-			},
-		}
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	ctx, err := c.tokenEndpointContext(r.Context(), oauth2Config.Endpoint.TokenURL)
+	if err != nil {
+		return identity, err
 	}
 
 	token, err := oauth2Config.Exchange(ctx, q.Get("code"))
@@ -297,6 +305,30 @@ func (c *microsoftConnector) HandleCallback(s connector.Scopes, connData []byte,
 
 	client := oauth2Config.Client(ctx, token)
 
+	identity, err = c.userIdentity(ctx, client, s)
+	if err != nil {
+		return identity, err
+	}
+
+	if s.OfflineAccess {
+		data := connectorData{
+			AccessToken:  token.AccessToken,
+			RefreshToken: token.RefreshToken,
+			Expiry:       token.Expiry,
+		}
+		connData, err := json.Marshal(data)
+		if err != nil {
+			return identity, fmt.Errorf("microsoft: marshal connector data: %v", err)
+		}
+		identity.ConnectorData = connData
+	}
+
+	return identity, nil
+}
+
+// userIdentity looks up the signed-in user through Graph with client and
+// builds their identity, resolving groups when s requires them.
+func (c *microsoftConnector) userIdentity(ctx context.Context, client *http.Client, s connector.Scopes) (identity connector.Identity, err error) {
 	user, err := c.user(ctx, client)
 	if err != nil {
 		return identity, fmt.Errorf("microsoft: get user: %v", err)
@@ -320,19 +352,6 @@ func (c *microsoftConnector) HandleCallback(s connector.Scopes, connData []byte,
 			return identity, fmt.Errorf("microsoft: get groups: %w", err)
 		}
 		identity.Groups = groups
-	}
-
-	if s.OfflineAccess {
-		data := connectorData{
-			AccessToken:  token.AccessToken,
-			RefreshToken: token.RefreshToken,
-			Expiry:       token.Expiry,
-		}
-		connData, err := json.Marshal(data)
-		if err != nil {
-			return identity, fmt.Errorf("microsoft: marshal connector data: %v", err)
-		}
-		identity.ConnectorData = connData
 	}
 
 	return identity, nil
@@ -380,26 +399,15 @@ func (c *microsoftConnector) Refresh(ctx context.Context, s connector.Scopes, id
 		Expiry:       data.Expiry,
 	}
 
-	// If using client assertion, wrap the HTTP client with a custom transport
-	if c.clientAssertion != "" {
-		assertionBytes, err := os.ReadFile(c.clientAssertion)
-		if err != nil {
-			return identity, fmt.Errorf("microsoft: failed to read client assertion: %v", err)
-		}
+	oauth2Config := c.oauth2Config(s)
 
-		oauth2Config := c.oauth2Config(s)
-		httpClient := &http.Client{
-			Transport: &assertionTransport{
-				assertion: strings.TrimSpace(string(assertionBytes)),
-				tokenURL:  oauth2Config.Endpoint.TokenURL,
-				base:      http.DefaultTransport,
-			},
-		}
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	ctx, err := c.tokenEndpointContext(ctx, oauth2Config.Endpoint.TokenURL)
+	if err != nil {
+		return identity, err
 	}
 
 	client := oauth2.NewClient(ctx, &notifyRefreshTokenSource{
-		new: c.oauth2Config(s).TokenSource(ctx, tok),
+		new: oauth2Config.TokenSource(ctx, tok),
 		t:   tok,
 		f: func(tok *oauth2.Token) error {
 			data := connectorData{
